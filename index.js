@@ -1,14 +1,56 @@
+/**
+ * CardioGuard - Improved Node.js backend (index.js)
+ * - Express + SQLite3
+ * - Input validation and normalization
+ * - Single async triggerEmergency implementation
+ * - Optional Twilio SMS integration via environment variables
+ *
+ * Environment variables:
+ *   PORT (default 3000)
+ *   TWILIO_ACCOUNT_SID
+ *   TWILIO_AUTH_TOKEN
+ *   TWILIO_FROM_NUMBER
+ *
+ * To run:
+ *   npm install
+ *   node index.js
+ */
+
+require('dotenv').config(); // optional: create a .env file for local development
+
 const express = require('express');
-const bodyParser = require('body-parser');
 const sqlite3 = require('sqlite3').verbose();
-const axios = require('axios');
+const util = require('util');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json()); // modern express body parser
 
-const db = new sqlite3.Database('./cardio.db');
+// Database
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'cardio.db');
+const db = new sqlite3.Database(DB_FILE);
 
-// init tables
+// Promisified helpers
+const dbRun = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) return reject(err);
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
+  });
+
+const dbGet = (sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) return reject(err);
+      resolve(row);
+    });
+  });
+
+const appendFile = util.promisify(fs.appendFile);
+
+// Initialize tables
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,122 +69,198 @@ db.serialize(() => {
   )`);
 });
 
-// register user (simple)
-app.post('/api/register', (req, res) => {
-  const { name, phone, emergency_contact } = req.body;
-  db.run(`INSERT INTO users (name, phone, emergency_contact) VALUES (?, ?, ?)`,
-    [name, phone, emergency_contact],
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ user_id: this.lastID });
-    });
-});
+// Twilio optional
+const TWILIO_ENABLED =
+  process.env.TWILIO_ACCOUNT_SID &&
+  process.env.TWILIO_AUTH_TOKEN &&
+  process.env.TWILIO_FROM_NUMBER;
 
-// receive reading
-app.post('/api/readings', (req, res) => {
-  const { user_id, heart_rate, accel } = req.body; // accel: {x,y,z}
-  db.run(`INSERT INTO readings (user_id, heart_rate, accel_x, accel_y, accel_z) VALUES (?, ?, ?, ?, ?)`,
-    [user_id, heart_rate, accel.x, accel.y, accel.z],
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      // after storing, run simple rule-based check
-      checkForEmergency(user_id, heart_rate, accel).then(triggered => {
-        res.json({ inserted: this.lastID, emergency: triggered });
-      });
-    });
-});
-
-// simple emergency logic
-async function checkForEmergency(user_id, heart_rate, accel) {
-  // RULE 1: bradycardia (very low heart rate)
-  if (heart_rate !== null && heart_rate <= 40) {
-    // confirm: look at last N readings? for MVP we trigger if single reading <=40
-    await triggerEmergency(user_id, 'Low heart rate detected: ' + heart_rate);
-    return true;
-  }
-  // RULE 2: fall detection simple (large sudden acceleration + low activity)
-  const mag = Math.sqrt(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
-  // threshold example: sudden spike > 18 m/s^2 (tweak in real tests)
-  if (mag > 18) {
-    await triggerEmergency(user_id, 'Possible fall detected. Accel magnitude: ' + mag.toFixed(2));
-    return true;
-  }
-  return false;
-}
-
-// trigger emergency: for prototype we just log + placeholder to call external service
-async function triggerEmergency(user_id, message) {
-  console.log('*** TRIGGER EMERGENCY for user', user_id, message);
-  // get user contact
-  db.get(`SELECT * FROM users WHERE id = ?`, [user_id], (err, row) => {
-    if (err || !row) {
-      console.error('No user found or db error', err);
-      return;
-    }
-    // Example actions:
-    // 1) Send SMS/Call to emergency contact (use Twilio or local provider) - placeholder
-    // 2) Send location request to app (if app supports location push)
-    // For prototype we just print
-    console.log(`Notify emergency contact ${row.emergency_contact} about user ${row.name}. Message: ${message}`);
-    // If you want, integrate Twilio here (need account + credentials)
-    // Example (pseudo):
-    // await axios.post('https://api.twilio.com/...', {...})
-  });
-}
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Backend running on', PORT));
-
-
-// === Twilio integration (optional) ===
-// To enable Twilio SMS/Call, set the following environment variables:
-// TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
-
-const TWILIO_ENABLED = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM_NUMBER;
 let twilioClient = null;
 if (TWILIO_ENABLED) {
   const Twilio = require('twilio');
   twilioClient = new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 }
 
+/**
+ * sendSms: sends SMS via Twilio if configured, otherwise logs
+ */
 async function sendSms(to, body) {
   if (!TWILIO_ENABLED) {
-    console.log('Twilio not enabled. SMS to', to, 'body:', body);
+    console.log('[SMS stub] To:', to, 'Body:', body);
     return;
   }
   try {
     await twilioClient.messages.create({
-      body: body,
+      body,
       from: process.env.TWILIO_FROM_NUMBER,
-      to: to
+      to,
     });
     console.log('Sent SMS to', to);
   } catch (e) {
-    console.error('Twilio SMS error', e.message);
+    console.error('Twilio SMS error', e && e.message ? e.message : e);
+    throw e;
   }
 }
 
-// modify triggerEmergency to use sendSms
-const fs = require('fs');
-// override existing triggerEmergency by redefining (simple approach for MVP)
+/**
+ * triggerEmergency: unified emergency handler
+ * - Looks up user
+ * - Sends SMS to emergency contact if present
+ * - Writes audit log to emergency.log
+ */
 async function triggerEmergency(user_id, message) {
   console.log('*** TRIGGER EMERGENCY for user', user_id, message);
-  db.get(`SELECT * FROM users WHERE id = ?`, [user_id], (err, row) => {
-    if (err || !row) {
-      console.error('No user found or db error', err);
+  try {
+    const row = await dbGet(`SELECT * FROM users WHERE id = ?`, [user_id]);
+    if (!row) {
+      console.error('No user found for id', user_id);
       return;
     }
-    console.log(`Notify emergency contact ${row.emergency_contact} about user ${row.name}. Message: ${message}`);
-    // Send SMS to emergency contact (if configured)
-    if (row.emergency_contact) {
-      sendSms(row.emergency_contact, `Emergency for ${row.name}: ${message}`);
+
+    const contact = row.emergency_contact || null;
+    const userName = row.name || `user#${user_id}`;
+
+    console.log(`Notify emergency contact ${contact} about user ${userName}. Message: ${message}`);
+
+    if (contact) {
+      try {
+        await sendSms(contact, `Emergency for ${userName}: ${message}`);
+      } catch (smsErr) {
+        console.error('Failed to send SMS to emergency contact:', smsErr && smsErr.message ? smsErr.message : smsErr);
+      }
     }
-    // Save a log file for audit
+
+    const logLine = `${new Date().toISOString()} | EMERGENCY | user:${userName} | contact:${contact} | msg:${message}\n`;
     try {
-      const logLine = `${new Date().toISOString()} | EMERGENCY | user:${row.name} | contact:${row.emergency_contact} | msg:${message}\n`;
-      fs.appendFileSync('./emergency.log', logLine);
-    } catch (e) { console.error('Log write error', e.message); }
-  });
+      await appendFile(path.join(__dirname, 'emergency.log'), logLine);
+    } catch (logErr) {
+      console.error('Failed to write emergency log:', logErr && logErr.message ? logErr.message : logErr);
+    }
+  } catch (err) {
+    console.error('triggerEmergency error', err && err.message ? err.message : err);
+  }
 }
 
-// End of Twilio integration
+/**
+ * checkForEmergency: returns true if emergency triggered
+ * - Robust numeric checks
+ * - Accepts accel object where values may be null
+ */
+async function checkForEmergency(user_id, heart_rate, accel = {}) {
+  // Normalize heart rate
+  const hrNum = heart_rate === undefined || heart_rate === null ? null : Number(heart_rate);
+  if (hrNum !== null && !Number.isNaN(hrNum)) {
+    // RULE: bradycardia
+    if (hrNum <= 40) {
+      await triggerEmergency(user_id, `Low heart rate detected: ${hrNum}`);
+      return true;
+    }
+    // Example additional rule: very high heart rate
+    if (hrNum >= 180) {
+      await triggerEmergency(user_id, `Very high heart rate detected: ${hrNum}`);
+      return true;
+    }
+  }
+
+  // Normalize accel components
+  const ax = accel && typeof accel.x === 'number' ? accel.x : null;
+  const ay = accel && typeof accel.y === 'number' ? accel.y : null;
+  const az = accel && typeof accel.z === 'number' ? accel.z : null;
+
+  // If we have all components, compute magnitude
+  if (ax !== null && ay !== null && az !== null) {
+    const mag = Math.sqrt(ax * ax + ay * ay + az * az);
+    // Threshold for possible fall — tune as needed
+    if (mag > 18) {
+      await triggerEmergency(user_id, `Possible fall detected. Accel magnitude: ${mag.toFixed(2)}`);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Routes
+
+// Health
+app.get('/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
+
+// Register user
+app.post('/api/register', async (req, res) => {
+  try {
+    const { name, phone, emergency_contact } = req.body;
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    const result = await dbRun(
+      `INSERT INTO users (name, phone, emergency_contact) VALUES (?, ?, ?)`,
+      [name, phone || null, emergency_contact || null]
+    );
+    res.json({ user_id: result.lastID });
+  } catch (err) {
+    console.error('Register error', err && err.message ? err.message : err);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Receive reading
+app.post('/api/readings', async (req, res) => {
+  try {
+    const { user_id, heart_rate, accel } = req.body;
+
+    if (!user_id) return res.status(400).json({ error: 'user_id is required' });
+
+    // Normalize accel values to numbers or null
+    const ax = accel && typeof accel.x === 'number' ? accel.x : null;
+    const ay = accel && typeof accel.y === 'number' ? accel.y : null;
+    const az = accel && typeof accel.z === 'number' ? accel.z : null;
+
+    // Insert reading -- allow nulls
+    const insertResult = await dbRun(
+      `INSERT INTO readings (user_id, heart_rate, accel_x, accel_y, accel_z) VALUES (?, ?, ?, ?, ?)`,
+      [user_id, heart_rate === undefined ? null : heart_rate, ax, ay, az]
+    );
+
+    const insertedId = insertResult.lastID;
+
+    // Run emergency check (do not block DB response for long-running tasks too much)
+    // We'll await here to return emergency status; in production you may offload to a job queue.
+    try {
+      const emergency = await checkForEmergency(user_id, heart_rate, { x: ax, y: ay, z: az });
+      return res.json({ inserted: insertedId, emergency });
+    } catch (checkErr) {
+      console.error('Emergency check failed', checkErr && checkErr.message ? checkErr.message : checkErr);
+      return res.json({ inserted: insertedId, emergency: false, warning: 'emergency check failed' });
+    }
+  } catch (err) {
+    console.error('Readings error', err && err.message ? err.message : err);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Simple endpoint to fetch last N readings for a user (admin/debug)
+app.get('/api/users/:id/readings', async (req, res) => {
+  try {
+    const uid = Number(req.params.id);
+    if (Number.isNaN(uid)) return res.status(400).json({ error: 'invalid user id' });
+
+    const rows = await new Promise((resolve, reject) => {
+      db.all(
+        `SELECT id, user_id, timestamp, heart_rate, accel_x, accel_y, accel_z FROM readings WHERE user_id = ? ORDER BY timestamp DESC LIMIT 100`,
+        [uid],
+        (err, results) => {
+          if (err) return reject(err);
+          resolve(results);
+        }
+      );
+    });
+
+    res.json({ readings: rows });
+  } catch (err) {
+    console.error('Fetch readings error', err && err.message ? err.message : err);
+    res.status(500).json({ error: 'internal_server_error' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`CardioGuard backend running on port ${PORT}`));
