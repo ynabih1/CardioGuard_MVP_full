@@ -70,5 +70,4 @@ npm run dev
 - Emergency events are appended to `emergency.log` in the project directory.
 
 ## License
-
-MIT
+youssef nabih
